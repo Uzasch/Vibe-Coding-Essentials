@@ -6,5 +6,6 @@ https://www.deeplearning.ai/the-batch/the-ai-engineering-skills-map-in-detail-so
 
 
 
-##Trying to find issues
+## Trying to find issues
+
 https://github.com/usestrix/strix
