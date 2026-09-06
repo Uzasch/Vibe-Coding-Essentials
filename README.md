@@ -52,14 +52,14 @@ Prompt your AI coding agent to implement these 5 performance fixes before shippi
 
 To understand why a Context Engine is necessary, look at what actually makes autonomous agents work in production: **context**.
 
-Early LLM architectures relied almost entirely on **naive RAG**. In practice, these operated as glorified FAQ summarizers: extract static chunks from a PDF or help center doc, pass them to the prompt, and request a summary. Autonomous agents break this paradigm completely. Agents do not merely read and summarize—they plan, invoke executable tools, fetch real-time state, inspect feedback, and run cyclic reasoning loops. Supporting this autonomy requires an architectural shift away from static retrieval.
+Early LLM architectures relied almost entirely on **naive RAG**. In practice, these operated as glorified FAQ summarizers: extract static chunks from a PDF or help center doc, pass them to the prompt, and request a summary. Autonomous agents break this paradigm completely. Agents do not merely read and summarize—they plan, invoke executable tools, fetch real-time state, inspect feedback, and run cyclic reasoning loops. Supporting this autonomy requires an architectural shift away from static retrieval to an in-memory real-time substrate powered by **Redis**.
 
 #### 1. External Context (The Real-World State)
 Enterprise environments typically rely on 40 to 50 disparate systems of record: PostgreSQL, MySQL, Salesforce, ERPs, and internal REST APIs. Connecting an LLM agent directly to 50 raw database connections leads to severe failure modes: runaway token costs, excessive roundtrip latency, and hallucinations stemming from unconstrained SQL generation.
 
-Instead, change-data-capture (CDC) pipelines stream updates into a unified, **materialized in-memory view**.
+Instead, change-data-capture (CDC) pipelines stream updates directly into an in-memory **materialized view hosted in Redis**.
 
-A **semantic layer** is placed directly on top of this view. Rather than exposing cryptic table names, relational foreign keys, or raw hash sets (e.g., `tbl_usr_v2`, `c_ts_epoch`), the layer abstracts data into explicit business concepts—such as `Customer`, `Order`, or `RefundPolicy`—the way an operator thinks about the domain. Exposing these entities through the **Model Context Protocol (MCP)** or CLI endpoints provides the agent with structured, typed tools to read and write data safely.
+A **semantic layer** is placed directly on top of this Redis view. Rather than exposing cryptic table names, relational foreign keys, or raw hash sets (e.g., `tbl_usr_v2`, `c_ts_epoch`), the layer abstracts data into explicit business concepts—such as `Customer`, `Order`, or `RefundPolicy`—the way an operator thinks about the domain. Exposing these entities through the **Model Context Protocol (MCP)** or CLI endpoints provides the agent with structured, typed tools to read and write data safely.
 
 #### 2. Internal Context (The Agent's Brain)
 External system state represents only half the context loop. The agent also requires an internal memory system to record its own execution journey:
@@ -67,7 +67,7 @@ External system state represents only half the context loop. The agent also requ
 * Tool failure logs, retries, and successful recovery strategies.
 * User preferences, historical corrections, and episodic business facts.
 
-An adjacent **semantic cache** sits in front of the execution loop. When incoming user intent matches a previously solved query with high vector similarity, the cache returns the answer instantly. This bypasses model inference entirely, slashing token costs and driving roundtrip latency under 10ms.
+An adjacent **semantic cache (powered by Redis)** sits in front of the execution loop. When incoming user intent matches a previously solved query with high vector similarity, the cache returns the answer instantly. This bypasses model inference entirely, slashing token costs and driving roundtrip latency under 10ms.
 
 ---
 
@@ -94,15 +94,15 @@ flowchart TD
     subgraph External["1. External Context (World State)"]
         direction TB
         E1["<b>Systems of Record</b><br/>PostgreSQL, MySQL, CRMs, ERPs, APIs"]
-        -->|CDC / Debezium / RDI| E2["<b>Materialized In-Memory View</b><br/>Unified real-time cache (Sub-millisecond)"]
+        -->|CDC / Debezium / RDI| E2["<b>Materialized In-Memory View (Redis)</b><br/>Unified real-time cache (Sub-millisecond)"]
         -->|Semantic Mapping| E3["<b>Semantic Layer</b><br/>Entities & Business Rules (Users, Orders)"]
         -->|Protocol Binding (JSON-RPC 2.0)| E4["<b>MCP Servers & Native CLI Tools</b><br/>FastMCP • Redis Context Retriever"]
     end
 
     subgraph Internal["2. Internal Memory (Cognitive State)"]
         direction TB
-        I1["<b>Working Session Memory</b><br/>Short-term turn traces & checkpoints<br/><i>(Postgres / Redis Checkpointers)</i>"]
-        -->|Async Fact Extraction| I2["<b>Compounding Long-Term Memory</b><br/>Episodic & semantic persistence<br/><i>(Mem0 • Qdrant • Redis Memory Server)</i>"]
+        I1["<b>Working Session Memory</b><br/>Short-term turn traces & checkpoints<br/><i>(Redis Checkpointers / Postgres)</i>"]
+        -->|Async Fact Extraction| I2["<b>Compounding Long-Term Memory</b><br/>Episodic & semantic persistence<br/><i>(Redis Memory Server • Mem0 • Qdrant)</i>"]
         --> I3["<b>Temporal Knowledge & Profiles</b><br/>Dynamic graph links & learned rules"]
     end
 
@@ -110,7 +110,7 @@ flowchart TD
         direction TB
         C1["<b>Incoming Intent Embedding</b><br/>Vector similarity match"]
         --> C2{"Cosine Similarity<br/>> 0.92?"}
-        C2 -->|Hit: Sub-10ms| C3["<b>Instant Cached Answer</b><br/>0 Tokens consumed"]
+        C2 -->|Hit: Sub-10ms| C3["<b>Instant Cached Answer</b><br/>0 Tokens consumed (Redis Cache)"]
         C2 -->|Miss| C4["<b>Cache Miss Route</b><br/>Execute inference<br/><i>(LangCache • GPTCache • LiteLLM)</i>"]
     end
 
@@ -124,24 +124,24 @@ flowchart TD
 ### The Three Context Engine Primitives
 
 1. **Fresh & Navigable State**  
-   Operational data streams continuously from source databases via CDC into in-memory materialized views. Business concepts are surfaced through MCP as strongly-typed, navigable entity graphs rather than fragile, generated SQL queries.
+   Operational data streams continuously from source databases via CDC into in-memory materialized views in Redis. Business concepts are surfaced through MCP as strongly-typed, navigable entity graphs rather than fragile, generated SQL queries.
 2. **Compounding Memory**  
    Completed turns trigger an asynchronous background worker that extracts facts, user preferences, corrections, and execution traces. This pipeline promotes salient episodic data into long-term vector/graph stores without adding latency to the main execution thread.
 3. **Sub-10ms Semantic Caching**  
-   A dedicated caching layer vectorizes incoming prompts and runs similarity lookups against previous responses. Hits bypass model inference completely ($0 token cost), while misses proceed through the agent's full execution graph.
+   A dedicated Redis vector caching layer evaluates incoming prompts and runs similarity lookups against previous responses. Hits bypass model inference completely ($0 token cost), while misses proceed through the agent's full execution graph.
 
 ---
 
 ### Reference Implementation: Redis Iris
 
-Redis Iris provides an end-to-end blueprint for this architecture by integrating each operational layer into a unified platform:
+Redis Iris provides an end-to-end blueprint for this architecture by integrating each operational layer into a unified platform on top of Redis:
 
 | Redis Iris Component | Architectural Role | Functionality |
 | :--- | :--- | :--- |
 | **Redis Data Integration (RDI)** | External Pipeline (ETL / CDC) | Streams live delta changes out of upstream relational databases and CRMs directly into Redis to maintain up-to-date materialized views. |
-| **Context Retriever** | Semantic Layer & MCP Server | Abstracts raw Redis keys into typed business entities (Users, Orders, Inventory) and serves them as MCP endpoints for LLM tool invocation. |
+| **Context Retriever** | Semantic Layer & MCP Server | Abstracts raw Redis data structures into typed business entities (Users, Orders, Inventory) and serves them as MCP endpoints for LLM tool invocation. |
 | **Agent Memory Server** | Internal Memory Pipeline | Tracks multi-turn session checkpoints, logs decisions, and extracts compounding episodic facts over time so the agent adapts across runs. |
-| **Semantic Cache** | Token Bypass Layer | Performs vector similarity checks against prior solved prompts, returning instant answers (sub-10ms) without triggering LLM inference calls. |
+| **Semantic Cache** | Token Bypass Layer | Performs vector similarity checks against prior solved prompts in Redis, returning instant answers (sub-10ms) without triggering LLM inference calls. |
 
 ---
 
@@ -156,9 +156,11 @@ Redis Iris provides an end-to-end blueprint for this architecture by integrating
 * **LlamaIndex Workflows:** Step-based, event-driven orchestration optimized for data-centric retrieval and ingestion pipelines.
 
 ### Vector Databases & Semantic Storage
+* **Redis (RedisVL / Redis Vector Search):** Ultra-low-latency in-memory vector database and key-value store optimized for semantic caching, session checkpointers, and real-time agent memory.
 * **Qdrant:** Rust-native vector search engine with JSON payload filtering, scalar/product quantization, and first-party MCP support (`mcp-server-qdrant`).
 * **pgvector (PostgreSQL):** Relational extension co-locating embeddings alongside operational transactional records.
 * **Pinecone:** Serverless, managed vector store engineered for low-maintenance cloud scale.
 * **Weaviate:** Open-source vector engine supporting native hybrid search (BM25 + dense vectors) and entity cross-referencing.
 * **Milvus / Zilliz:** Distributed, cloud-native vector infrastructure designed for multi-billion vector datasets.
 * **Chroma:** Lightweight, embeddable vector database ideal for local testing, integration suites, and fast prototyping.
+
